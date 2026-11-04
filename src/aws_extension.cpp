@@ -14,14 +14,19 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <aws/core/Aws.h>
+#include <mutex>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/ClientConfiguration.h>
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-	Aws::SDKOptions options;
-	Aws::InitAPI(options);
+	// InitAPI() mutates process-global SDK state without locking, so run it once per process.
+	static std::once_flag init_api_flag;
+	std::call_once(init_api_flag, []() {
+		Aws::SDKOptions options;
+		Aws::InitAPI(options);
+	});
 
 	// Opt-in on native, where the default keeps the AWS SDK's own HTTP client; defaults to true
 	// under wasm, where the bridge is the only path and the setting is otherwise ignored.

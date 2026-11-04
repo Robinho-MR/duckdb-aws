@@ -9,6 +9,7 @@
 #include "duckdb/main/extension_helper.hpp"
 
 #include <aws/core/client/ClientConfiguration.h>
+#include <mutex>
 #include <aws/core/http/HttpClient.h>
 #include <aws/core/http/HttpClientFactory.h>
 #include <aws/core/http/HttpRequest.h>
@@ -338,6 +339,12 @@ public:
 	explicit DuckDBAwsHttpClientFactory(weak_ptr<DatabaseInstance> db_p) : db(std::move(db_p)) {
 	}
 
+	//! Points the fallback (used outside any AwsInstanceBinding) at the most recently loaded instance.
+	void SetFallbackInstance(weak_ptr<DatabaseInstance> db_p) {
+		lock_guard<mutex> guard(db_lock);
+		db = std::move(db_p);
+	}
+
 	void InitStaticState() override {
 #if AWS_HTTP_SDK_FALLBACK_CURL
 		EnsureCurlGlobalState();
@@ -359,6 +366,7 @@ public:
 		if (!bound_instance.expired()) {
 			return bound_instance;
 		}
+		lock_guard<mutex> guard(db_lock);
 		return db;
 	}
 
@@ -405,17 +413,27 @@ public:
 	}
 
 private:
+	mutable mutex db_lock;
 	weak_ptr<DatabaseInstance> db;
 };
 
 } // namespace
 
 void RegisterDuckDBAwsHttpClientFactory(DatabaseInstance &db) {
-	// NOTE: Aws::Http::SetHttpClientFactory is process-global, so with several DatabaseInstances
-	// in one process the last LOAD wins and all AWS traffic follows that instance's HTTP
-	// settings. The weak_ptr keeps that from becoming a use-after-free when it is closed.
+	// NOTE: the SDK factory is process-global, so with several DatabaseInstances in one process the last
+	// LOAD wins for clients built outside an AwsInstanceBinding. The weak_ptr keeps that from becoming a
+	// use-after-free when it is closed.
+	// SetHttpClientFactory() tears down and rebuilds global SDK/curl state without any locking, so it is
+	// installed exactly once; later loads only retarget the fallback instance.
+	static std::once_flag install_flag;
+	static std::shared_ptr<DuckDBAwsHttpClientFactory> factory;
 	weak_ptr<DatabaseInstance> weak_db = db.shared_from_this();
-	Aws::Http::SetHttpClientFactory(Aws::MakeShared<DuckDBAwsHttpClientFactory>("DuckDBAwsHttp", weak_db));
+	std::call_once(install_flag, [&]() {
+		auto new_factory = Aws::MakeShared<DuckDBAwsHttpClientFactory>("DuckDBAwsHttp", weak_db);
+		Aws::Http::SetHttpClientFactory(new_factory);
+		factory = std::move(new_factory);
+	});
+	factory->SetFallbackInstance(std::move(weak_db));
 }
 
 } // namespace duckdb
